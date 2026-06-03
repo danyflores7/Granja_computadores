@@ -44,3 +44,15 @@ __pycache__/
 .vscode/
 .idea/
 .gemini/
+
+# 5. Archivos locales de pruebas, configuraciones y wrappers históricos
+debug_hosts
+lib_wrapper.c
+para_image_parra.c
+run_capture.sh
+test_cluster.cpp
+test_config.cfg
+test_config_5.cfg
+test_hosts
+test_imagenes.cpp
+test_images.cpp
