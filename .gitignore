@@ -1,0 +1,46 @@
+# ==============================================================================
+# Gitignore para Proyecto Clúster MPI de Procesamiento de Imágenes
+# Excluye ejecutables binarios compilados y archivos pesados de imágenes
+# ==============================================================================
+
+# 1. Compilaciones y Ejecutables locales (Binarios)
+cluster_worker
+cluster_worker_mac
+cluster_worker_win
+cluster_worker.exe
+test_cluster
+test_imagenes
+cluster_worker_win.exe
+test_cluster.exe
+test_imagenes.exe
+*.o
+*.obj
+*.out
+
+# 2. Carpetas de Imágenes Pesadas y Salidas (Evita subir gigabytes a GitHub)
+img/
+**/img/
+images/
+**/images/
+*.zip
+*.tar.gz
+*.pcap
+
+# 3. Archivos de Configuración y Logs Locales de Ejecución
+appfile.cfg
+debug_appfile.cfg
+sockets_appfile.cfg
+test_appfile.cfg
+output_log.txt
+hosts
+# Excluir hosts locales pero puedes dejar hosts de plantilla. 
+# Si quieres compartir una plantilla de hosts, guárdala como hosts.template
+hosts.template
+
+# 4. Archivos temporales y cachés de Python / IDEs
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.idea/
+.gemini/
