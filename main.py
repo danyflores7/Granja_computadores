@@ -179,7 +179,7 @@ class MPIWorker(QThread):
                         ["sudo", "ip", "link", "add", "vip0", "type", "dummy"],
                         ["sudo", "ip", "addr", "add", f"{ip}/32", "dev", "vip0"],
                         ["sudo", "ip", "link", "set", "vip0", "up"],
-                        ["sudo", "iptables", "-t", "nat", "-D", "PREROUTING", "-d", f"{container_ip}/32", "-p", "tcp", "-m", "tcp", "--dport", "10000:10010", "-j", "DNAT", "--to-destination", ip],
+                        ["sudo", "iptables", "-t", "nat", "-F", "PREROUTING"],
                         ["sudo", "iptables", "-t", "nat", "-A", "PREROUTING", "-d", f"{container_ip}/32", "-p", "tcp", "-m", "tcp", "--dport", "10000:10010", "-j", "DNAT", "--to-destination", ip],
                         ["sudo", "iptables", "-t", "nat", "-F", "INPUT"]
                     ]
@@ -191,7 +191,7 @@ class MPIWorker(QThread):
                         ["docker", "exec", "-u", "root", "mpi_cluster_node", "ip", "link", "add", "vip0", "type", "dummy"],
                         ["docker", "exec", "-u", "root", "mpi_cluster_node", "ip", "addr", "add", f"{ip}/32", "dev", "vip0"],
                         ["docker", "exec", "-u", "root", "mpi_cluster_node", "ip", "link", "set", "vip0", "up"],
-                        ["docker", "exec", "-u", "root", "mpi_cluster_node", "iptables", "-t", "nat", "-D", "PREROUTING", "-d", f"{container_ip}/32", "-p", "tcp", "-m", "tcp", "--dport", "10000:10010", "-j", "DNAT", "--to-destination", ip],
+                        ["docker", "exec", "-u", "root", "mpi_cluster_node", "iptables", "-t", "nat", "-F", "PREROUTING"],
                         ["docker", "exec", "-u", "root", "mpi_cluster_node", "iptables", "-t", "nat", "-A", "PREROUTING", "-d", f"{container_ip}/32", "-p", "tcp", "-m", "tcp", "--dport", "10000:10010", "-j", "DNAT", "--to-destination", ip],
                         ["docker", "exec", "-u", "root", "mpi_cluster_node", "iptables", "-t", "nat", "-F", "INPUT"]
                     ]
@@ -222,7 +222,7 @@ class MPIWorker(QThread):
                     ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "sudo ip link add vip0 type dummy"],
                     ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, f"sudo ip addr add {ip}/32 dev vip0"],
                     ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "sudo ip link set vip0 up"],
-                    ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, f"sudo iptables -t nat -D PREROUTING -d {remote_container_ip}/32 -p tcp -m tcp --dport 10000:10010 -j DNAT --to-destination {ip}"],
+                    ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "sudo iptables -t nat -F PREROUTING"],
                     ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, f"sudo iptables -t nat -A PREROUTING -d {remote_container_ip}/32 -p tcp -m tcp --dport 10000:10010 -j DNAT --to-destination {ip}"],
                     ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "sudo iptables -t nat -F INPUT"],
                     ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "mkdir -p /home/mpiuser/img"],
