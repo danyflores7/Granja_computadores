@@ -340,12 +340,12 @@ class MPIWorker(QThread):
         # Determinar si estamos en el contenedor Docker o en el Host Windows
         if self.in_container:
             os.environ["MPIEXEC_PORT_RANGE"] = "10000:10010"
-            os.environ["MPICH_PORT_RANGE"] = "10000:10010"
+            os.environ["MPICH_PORT_RANGE"] = "10001:10010"
             cmd = [
                 "mpiexec",
                 "-f", "hosts",
                 "-genv", "FI_PROVIDER", "tcp",
-                "-genv", "FI_TCP_PORT_LOW_RANGE", "10000",
+                "-genv", "FI_TCP_PORT_LOW_RANGE", "10001",
                 "-genv", "FI_TCP_PORT_HIGH_RANGE", "10010",
                 "-configfile", "appfile.cfg"
             ]
@@ -354,13 +354,13 @@ class MPIWorker(QThread):
                 "docker", "exec", "-i", 
                 "-u", "mpiuser", 
                 "-e", "MPIEXEC_PORT_RANGE=10000:10010", 
-                "-e", "MPICH_PORT_RANGE=10000:10010",
+                "-e", "MPICH_PORT_RANGE=10001:10010",
                 "-w", "/home/mpiuser/reto_final",
                 "mpi_cluster_node",
                 "mpiexec",
                 "-f", "hosts",
                 "-genv", "FI_PROVIDER", "tcp",
-                "-genv", "FI_TCP_PORT_LOW_RANGE", "10000",
+                "-genv", "FI_TCP_PORT_LOW_RANGE", "10001",
                 "-genv", "FI_TCP_PORT_HIGH_RANGE", "10010",
                 "-configfile", "appfile.cfg"
             ]
