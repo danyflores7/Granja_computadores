@@ -251,6 +251,51 @@ class MPIWorker(QThread):
                 except Exception:
                     pass
 
+        # Generar alias para cada IP remota para saltarse el chequeo de IP de Hydra en Docker Desktop
+        ip_to_alias = {}
+        for idx, rip in enumerate(remote_ips):
+            ip_to_alias[rip] = f"esclavo_{idx + 1}"
+
+        if remote_ips:
+            ssh_config_lines = ["Host *", "    Port 2222", "    StrictHostKeyChecking no", "    UserKnownHostsFile /dev/null", ""]
+            for rip, alias in ip_to_alias.items():
+                ssh_config_lines.append(f"Host {alias}")
+                ssh_config_lines.append(f"    HostName {rip}")
+                ssh_config_lines.append(f"    Port 2222")
+                ssh_config_lines.append("")
+            
+            ssh_config_content = "\n".join(ssh_config_lines)
+            if self.in_container:
+                try:
+                    with open("/home/mpiuser/.ssh/config", "w") as sf:
+                        sf.write(ssh_config_content)
+                except Exception:
+                    pass
+            else:
+                try:
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(mode='w', delete=False) as tf:
+                        tf.write(ssh_config_content)
+                        tf_path = tf.name
+                    subprocess.run(["docker", "cp", tf_path, "mpi_cluster_node:/home/mpiuser/.ssh/config"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["docker", "exec", "-u", "root", "mpi_cluster_node", "chown", "mpiuser:root", "/home/mpiuser/.ssh/config"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["docker", "exec", "-u", "root", "mpi_cluster_node", "chmod", "600", "/home/mpiuser/.ssh/config"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    os.unlink(tf_path)
+                except Exception:
+                    pass
+
+            etc_hosts_line = "172.18.0.1 " + " ".join(ip_to_alias.values())
+            if self.in_container:
+                try:
+                    subprocess.run(["sudo", "sh", "-c", f"grep -q '{etc_hosts_line}' /etc/hosts || echo '{etc_hosts_line}' >> /etc/hosts"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+            else:
+                try:
+                    subprocess.run(["docker", "exec", "-u", "root", "mpi_cluster_node", "sh", "-c", f"grep -q '{etc_hosts_line}' /etc/hosts || echo '{etc_hosts_line}' >> /etc/hosts"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+
         # Configurar todos los nodos del clúster
         appfile_lines = []
         for ip in hosts_ips:
@@ -259,11 +304,15 @@ class MPIWorker(QThread):
             
             if is_local:
                 binary_name = "/home/mpiuser/reto_final/cluster_worker"
+                host_param = ip
             else:
+                alias = ip_to_alias[ip]
+                host_param = alias
+                
                 # Determinar nombre del binario según arquitectura del nodo remoto
                 ssh_prefix = [] if self.in_container else ["docker", "exec", "-u", "mpiuser", "mpi_cluster_node"]
                 try:
-                    res_arch = subprocess.run(ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "uname -m"], capture_output=True, text=True, timeout=5)
+                    res_arch = subprocess.run(ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", host_param, "uname -m"], capture_output=True, text=True, timeout=5)
                     arch_type = res_arch.stdout.strip()
                 except Exception:
                     arch_type = "x86_64"
@@ -275,7 +324,7 @@ class MPIWorker(QThread):
                 
             cleanup_and_setup_vip(ip, is_local)
             
-            appfile_lines.append(f"-env MPICH_INTERFACE_HOSTNAME {ip} -env FI_TCP_IFACE vip0 -host {ip} -n {slots} {binary_name} {self.total_imagenes} {self.filter_mask} {self.k_grey} {self.k_color}")
+            appfile_lines.append(f"-env MPICH_INTERFACE_HOSTNAME {ip} -env FI_TCP_IFACE vip0 -host {host_param} -n {slots} {binary_name} {self.total_imagenes} {self.filter_mask} {self.k_grey} {self.k_color}")
 
         if not appfile_lines:
             appfile_lines.append(f"-env MPICH_INTERFACE_HOSTNAME 127.0.0.1 -host 127.0.0.1 -n 4 /home/mpiuser/reto_final/cluster_worker {self.total_imagenes} {self.filter_mask} {self.k_grey} {self.k_color}")
