@@ -207,6 +207,13 @@ class MPIWorker(QThread):
                 except Exception:
                     remote_container_ip = "172.19.0.2"
 
+                # Detectar la arquitectura del nodo remoto
+                try:
+                    res_arch = subprocess.run(ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "uname -m"], capture_output=True, text=True, timeout=5)
+                    arch_type = res_arch.stdout.strip()
+                except Exception:
+                    arch_type = "x86_64"
+
                 # Calcular la IP del gateway remoto basándonos en la IP de la subred del contenedor esclavo
                 remote_gateway = ".".join(remote_container_ip.split(".")[:3]) + ".1"
 
@@ -219,9 +226,16 @@ class MPIWorker(QThread):
                     ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, f"sudo iptables -t nat -A PREROUTING -d {remote_container_ip}/32 -p tcp -m tcp --dport 10000:10010 -j DNAT --to-destination {ip}"],
                     ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "sudo iptables -t nat -F INPUT"],
                     ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "mkdir -p /home/mpiuser/img"],
-                    ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "ln -sf /home/mpiuser/reto_final/images /home/mpiuser/images"],
-                    ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "cp /home/mpiuser/reto_final/cluster_worker_mac /home/mpiuser/cluster_worker_mac"]
+                    ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "ln -sf /home/mpiuser/reto_final/images /home/mpiuser/images"]
                 ]
+
+                # Copiar o compilar el binario correcto según la arquitectura
+                if "arm" in arch_type or "aarch64" in arch_type:
+                    cmds.append(ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "cp /home/mpiuser/reto_final/cluster_worker_mac /home/mpiuser/cluster_worker_mac"])
+                else:
+                    # En x86_64, compilar el binario para compatibilidad de librerías locales
+                    cmds.append(ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "mpic++ -fopenmp -o /home/mpiuser/reto_final/cluster_worker /home/mpiuser/reto_final/cluster_worker.c"])
+
                 # Usar la IP del master local como origen de SNAT en el esclavo
                 active_local_ip = local_ip if local_ip else "192.168.1.73"
                 cmds.append(ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, f"sudo iptables -t nat -A INPUT -s {remote_gateway}/32 -p tcp -m tcp --dport 10000:10010 -j SNAT --to-source {active_local_ip}"])
@@ -246,7 +260,18 @@ class MPIWorker(QThread):
             if is_local:
                 binary_name = "/home/mpiuser/reto_final/cluster_worker"
             else:
-                binary_name = "/home/mpiuser/cluster_worker_mac"
+                # Determinar nombre del binario según arquitectura del nodo remoto
+                ssh_prefix = [] if self.in_container else ["docker", "exec", "-u", "mpiuser", "mpi_cluster_node"]
+                try:
+                    res_arch = subprocess.run(ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "uname -m"], capture_output=True, text=True, timeout=5)
+                    arch_type = res_arch.stdout.strip()
+                except Exception:
+                    arch_type = "x86_64"
+                
+                if "arm" in arch_type or "aarch64" in arch_type:
+                    binary_name = "/home/mpiuser/cluster_worker_mac"
+                else:
+                    binary_name = "/home/mpiuser/reto_final/cluster_worker"
                 
             cleanup_and_setup_vip(ip, is_local)
             
