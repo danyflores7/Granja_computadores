@@ -304,7 +304,7 @@ class MPIWorker(QThread):
             
             if is_local:
                 binary_name = "/home/mpiuser/reto_final/cluster_worker"
-                host_param = ip
+                host_param = "127.0.0.1"
             else:
                 alias = ip_to_alias[ip]
                 host_param = alias
