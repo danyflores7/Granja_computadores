@@ -56,3 +56,9 @@ test_config_5.cfg
 test_hosts
 test_imagenes.cpp
 test_images.cpp
+scratch_test.py
+test_config_local_wifi.cfg
+hosts_wifi
+
+# 6. Variables de entorno con secretos (Tailscale auth key, etc.)
+.env

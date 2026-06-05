@@ -1,41 +1,64 @@
 # ==============================================================================
 # Docker Compose para Nodo Individual en Clúster MPICH Híbrido
-# Diseñado para Mac M1 (Apple Silicon) y Windows x86_64 usando Tailscale
+# Arquitectura: Tailscale sidecar + MPI node con network namespace compartido
+# Esto elimina el problema de NAT/masquerading de Docker Desktop en Mac/Windows
 # ==============================================================================
 
 version: '3.8'
 
 services:
+
+  # ---------------------------------------------------------------
+  # Tailscale sidecar: crea la interfaz VPN y maneja el networking
+  # Los puertos de Docker se mapean aquí porque mpi-node comparte
+  # el namespace de red de este contenedor.
+  # ---------------------------------------------------------------
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: mpi_tailscale
+    hostname: ${TS_HOSTNAME:-mpi-node}
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false
+      - TS_ROUTES=
+      - TS_ACCEPT_DNS=false
+    volumes:
+      - tailscale_state:/var/lib/tailscale
+    ports:
+      # Puerto SSH para orquestación MPI (remapeado a 2222 en el host)
+      - "2222:22"
+      # Rango de puertos MPI/Hydra (fallback para red física si Tailscale falla)
+      # - "10000-10010:10000-10010"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------
+  # MPI Node: comparte el namespace de red del sidecar Tailscale
+  # Esto permite que los procesos MPI usen la IP de Tailscale (100.x.x.x)
+  # directamente, sin restricciones de puerto ni NAT de Docker Desktop
+  # ---------------------------------------------------------------
   mpi-node:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: mpi_cluster_node
-    cap_add:
-      - NET_ADMIN
-    # Reiniciar el contenedor automáticamente a menos que se detenga manualmente
-    restart: unless-stopped
-    
-    # Mapeo de Puertos Fijos para comunicación a través de la red de Tailscale:
-    # 1. SSH para la orquestación e inicio de procesos de MPI.
-    # 2. Rango de puertos configurado en el Dockerfile para comunicaciones internas de MPI (Hydra).
-    ports:
-      - "2222:22"
-      - "10000-10010:10000-10010"
-      
-    # Montaje de volumen local para sincronizar código e imágenes dinámicamente
+    # Clave: compartir el stack de red del sidecar de Tailscale
+    network_mode: "service:tailscale"
+    depends_on:
+      - tailscale
     volumes:
       - .:/home/mpiuser/reto_final
-      
-    # Variables de entorno adicionales
+    cap_add:
+      - NET_ADMIN
     environment:
-      - DOCKER_HOST_IP=127.0.0.1
       - MPICH_PORT_RANGE=10000:10010
       - MPIEXEC_PORT_RANGE=10000:10010
+    restart: unless-stopped
 
-    # Nota sobre red 'host': 
-    # En Linux nativo, se podría utilizar 'network_mode: "host"'. Sin embargo, en macOS y 
-    # Windows, Docker corre sobre una máquina virtual, por lo que el modo 'host' no mapea 
-    # los puertos directamente a las interfaces de red del host (incluyendo la IP de Tailscale). 
-    # La solución de arriba (mapeo explícito de puertos) es la única compatible y robusta 
-    # multiplataforma.
+volumes:
+  tailscale_state:

@@ -88,7 +88,32 @@ class MPIWorker(QThread):
     def run(self):
         self.start_time = time.time()
         
+        # Helper to execute commands in the Master container or locally
+        def run_master_cmd(cmd, root=False, timeout=30):
+            if self.in_container:
+                if root:
+                    return subprocess.run(["sudo"] + cmd, capture_output=True, text=True, timeout=timeout)
+                else:
+                    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            else:
+                prefix = ["docker", "exec"]
+                if root:
+                    prefix += ["-u", "root"]
+                else:
+                    prefix += ["-u", "mpiuser"]
+                return subprocess.run(prefix + ["mpi_cluster_node"] + cmd, capture_output=True, text=True, timeout=timeout)
+
+        # Get local IPs of the master node container
+        master_ips = []
+        try:
+            res = run_master_cmd(["hostname", "-I"])
+            master_ips = res.stdout.strip().split()
+        except Exception:
+            pass
+
         def is_local_ip(ip):
+            if ip in master_ips:
+                return True
             import socket
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
@@ -98,18 +123,9 @@ class MPIWorker(QThread):
             except Exception:
                 return False
 
-        # Obtener el hostname del contenedor master (local)
-        if self.in_container:
-            import socket
-            master_hostname = socket.gethostname()
-        else:
-            try:
-                res = subprocess.run(["docker", "exec", "mpi_cluster_node", "hostname"], capture_output=True, text=True, timeout=5)
-                master_hostname = res.stdout.strip()
-            except Exception:
-                master_hostname = "mpi_cluster_node"
-
-        # Pre-parsear archivo 'hosts' para identificar local_ip y remote_ips para las reglas SNAT
+        # Pre-parsear archivo 'hosts' para identificar local_ip y remote_ips
+        # Con Tailscale sidecar, las IPs en 'hosts' son IPs de Tailscale (100.x.x.x)
+        # que los contenedores ven como propias, por lo que is_local_ip funciona directamente
         local_ip = None
         remote_ips = []
         hosts_ips = []
@@ -138,165 +154,21 @@ class MPIWorker(QThread):
                     else:
                         remote_ips.append(ip)
 
-        def cleanup_and_setup_vip(ip, is_local):
-            self.status_msg.emit(f"Configurando red en {'Local' if is_local else ip}...")
-            # 1. Limpieza de procesos huérfanos de cluster_worker y gestores MPI/Hydra
+        # 1. Limpieza de procesos previos (sin iptables — ya no se necesita con Tailscale sidecar)
+        for ip in hosts_ips:
+            is_local = is_local_ip(ip)
+            self.status_msg.emit(f"Limpiando nodo {'Local' if is_local else ip}...")
             if is_local:
-                if self.in_container:
-                    cmd_kill = ["sh", "-c", "pkill -9 -f cluster_worker ; pkill -9 -f mpiexec ; pkill -9 -f hydra_pmi_proxy"]
-                else:
-                    cmd_kill = ["docker", "exec", "-u", "mpiuser", "mpi_cluster_node", "sh", "-c", "pkill -9 -f cluster_worker ; pkill -9 -f mpiexec ; pkill -9 -f hydra_pmi_proxy"]
+                run_master_cmd(["sh", "-c", "pkill -9 -f cluster_worker ; pkill -9 -f mpiexec ; pkill -9 -f hydra_pmi_proxy"], root=True)
             else:
-                ssh_prefix = [] if self.in_container else ["docker", "exec", "-u", "mpiuser", "mpi_cluster_node"]
-                cmd_kill = ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "pkill -9 -f cluster_worker ; pkill -9 -f mpiexec ; pkill -9 -f hydra_pmi_proxy"]
-            try:
-                subprocess.run(cmd_kill, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
-            except Exception:
-                pass
+                run_master_cmd(["ssh", "-o", "ConnectTimeout=10", ip, "pkill -9 -f cluster_worker ; pkill -9 -f mpiexec ; pkill -9 -f hydra_pmi_proxy"])
 
-            # 2. Creación y configuración de la interfaz virtual vip0 y NAT iptables
-            if is_local:
-                # Intentar obtener la IP interna del contenedor Windows
-                if self.in_container:
-                    import socket
-                    try:
-                        container_ip = socket.gethostbyname(socket.gethostname())
-                    except Exception:
-                        container_ip = "172.18.0.2"
-                else:
-                    try:
-                        res = subprocess.run(["docker", "exec", "mpi_cluster_node", "hostname", "-I"], capture_output=True, text=True, timeout=5)
-                        container_ip = res.stdout.strip().split()[0]
-                    except Exception:
-                        container_ip = "172.18.0.2"
+        # 2. Compilar el backend de cluster_worker localmente en el Master
+        self.status_msg.emit("Compilando backend en nodo Master...")
+        run_master_cmd(["mpic++", "-fopenmp", "-o", "/home/mpiuser/reto_final/cluster_worker", "/home/mpiuser/reto_final/cluster_worker.c"])
 
-                # Calcular la IP del gateway local basándonos en la IP de la subred del contenedor
-                local_gateway = ".".join(container_ip.split(".")[:3]) + ".1"
-
-                if self.in_container:
-                    cmds = [
-                        ["sudo", "ip", "link", "delete", "vip0"],
-                        ["sudo", "ip", "link", "add", "vip0", "type", "dummy"],
-                        ["sudo", "ip", "addr", "add", f"{ip}/32", "dev", "vip0"],
-                        ["sudo", "ip", "link", "set", "vip0", "up"],
-                        ["sudo", "iptables", "-t", "nat", "-F", "PREROUTING"],
-                        ["sudo", "iptables", "-t", "nat", "-A", "PREROUTING", "-d", f"{container_ip}/32", "-p", "tcp", "-m", "tcp", "--dport", "10000:10010", "-j", "DNAT", "--to-destination", ip],
-                        ["sudo", "iptables", "-t", "nat", "-F", "INPUT"]
-                    ]
-                    for rip in remote_ips:
-                        cmds.append(["sudo", "iptables", "-t", "nat", "-A", "INPUT", "-s", f"{local_gateway}/32", "-p", "tcp", "-m", "tcp", "--dport", "10000:10010", "-j", "SNAT", "--to-source", rip])
-                else:
-                    cmds = [
-                        ["docker", "exec", "-u", "root", "mpi_cluster_node", "ip", "link", "delete", "vip0"],
-                        ["docker", "exec", "-u", "root", "mpi_cluster_node", "ip", "link", "add", "vip0", "type", "dummy"],
-                        ["docker", "exec", "-u", "root", "mpi_cluster_node", "ip", "addr", "add", f"{ip}/32", "dev", "vip0"],
-                        ["docker", "exec", "-u", "root", "mpi_cluster_node", "ip", "link", "set", "vip0", "up"],
-                        ["docker", "exec", "-u", "root", "mpi_cluster_node", "iptables", "-t", "nat", "-F", "PREROUTING"],
-                        ["docker", "exec", "-u", "root", "mpi_cluster_node", "iptables", "-t", "nat", "-A", "PREROUTING", "-d", f"{container_ip}/32", "-p", "tcp", "-m", "tcp", "--dport", "10000:10010", "-j", "DNAT", "--to-destination", ip],
-                        ["docker", "exec", "-u", "root", "mpi_cluster_node", "iptables", "-t", "nat", "-F", "INPUT"]
-                    ]
-                    for rip in remote_ips:
-                        cmds.append(["docker", "exec", "-u", "root", "mpi_cluster_node", "iptables", "-t", "nat", "-A", "INPUT", "-s", f"{local_gateway}/32", "-p", "tcp", "-m", "tcp", "--dport", "10000:10010", "-j", "SNAT", "--to-source", rip])
-            else:
-                ssh_prefix = [] if self.in_container else ["docker", "exec", "-u", "mpiuser", "mpi_cluster_node"]
-                
-                # Intentar obtener la IP interna del contenedor Mac via SSH
-                try:
-                    res = subprocess.run(ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "hostname -I"], capture_output=True, text=True, timeout=8)
-                    remote_container_ip = res.stdout.strip().split()[0]
-                except Exception:
-                    remote_container_ip = "172.19.0.2"
-
-                # Detectar la arquitectura del nodo remoto
-                try:
-                    res_arch = subprocess.run(ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "uname -m"], capture_output=True, text=True, timeout=5)
-                    arch_type = res_arch.stdout.strip()
-                except Exception:
-                    arch_type = "x86_64"
-
-                # Calcular la IP del gateway remoto basándonos en la IP de la subred del contenedor esclavo
-                remote_gateway = ".".join(remote_container_ip.split(".")[:3]) + ".1"
-
-                cmds = [
-                    ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "sudo ip link delete vip0"],
-                    ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "sudo ip link add vip0 type dummy"],
-                    ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, f"sudo ip addr add {ip}/32 dev vip0"],
-                    ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "sudo ip link set vip0 up"],
-                    ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "sudo iptables -t nat -F PREROUTING"],
-                    ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, f"sudo iptables -t nat -A PREROUTING -d {remote_container_ip}/32 -p tcp -m tcp --dport 10000:10010 -j DNAT --to-destination {ip}"],
-                    ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "sudo iptables -t nat -F INPUT"],
-                    ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "mkdir -p /home/mpiuser/img"],
-                    ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "ln -sf /home/mpiuser/reto_final/images /home/mpiuser/images"]
-                ]
-
-                # Copiar o compilar el binario correcto según la arquitectura
-                if "arm" in arch_type or "aarch64" in arch_type:
-                    cmds.append(ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "cp /home/mpiuser/reto_final/cluster_worker_mac /home/mpiuser/cluster_worker_mac"])
-                else:
-                    # En x86_64, compilar el binario para compatibilidad de librerías locales
-                    cmds.append(ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "mpic++ -fopenmp -o /home/mpiuser/reto_final/cluster_worker /home/mpiuser/reto_final/cluster_worker.c"])
-
-                # Usar la IP del master local como origen de SNAT en el esclavo
-                active_local_ip = local_ip if local_ip else "192.168.1.73"
-                cmds.append(ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, f"sudo iptables -t nat -A INPUT -s {remote_gateway}/32 -p tcp -m tcp --dport 10000:10010 -j SNAT --to-source {active_local_ip}"])
-                
-                # 3. Mapear el hostname del master en el archivo /etc/hosts del nodo remoto
-                if master_hostname:
-                    active_local_ip = local_ip if local_ip else "192.168.1.73"
-                    cmds.append(ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, f"sudo sh -c 'grep -q {master_hostname} /etc/hosts || echo {active_local_ip} {master_hostname} >> /etc/hosts'"])
-            
-            for cmd in cmds:
-                try:
-                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
-                except Exception:
-                    pass
-
-        # Generar alias para cada IP remota para saltarse el chequeo de IP de Hydra en Docker Desktop
-        ip_to_alias = {}
-        for idx, rip in enumerate(remote_ips):
-            ip_to_alias[rip] = f"esclavo_{idx + 1}"
-
-        if remote_ips:
-            ssh_config_lines = ["Host *", "    Port 2222", "    StrictHostKeyChecking no", "    UserKnownHostsFile /dev/null", ""]
-            for rip, alias in ip_to_alias.items():
-                ssh_config_lines.append(f"Host {alias}")
-                ssh_config_lines.append(f"    HostName {rip}")
-                ssh_config_lines.append(f"    Port 2222")
-                ssh_config_lines.append("")
-            
-            ssh_config_content = "\n".join(ssh_config_lines)
-            if self.in_container:
-                try:
-                    with open("/home/mpiuser/.ssh/config", "w") as sf:
-                        sf.write(ssh_config_content)
-                except Exception:
-                    pass
-            else:
-                try:
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(mode='w', delete=False) as tf:
-                        tf.write(ssh_config_content)
-                        tf_path = tf.name
-                    subprocess.run(["docker", "cp", tf_path, "mpi_cluster_node:/home/mpiuser/.ssh/config"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    subprocess.run(["docker", "exec", "-u", "root", "mpi_cluster_node", "chown", "mpiuser:root", "/home/mpiuser/.ssh/config"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    subprocess.run(["docker", "exec", "-u", "root", "mpi_cluster_node", "chmod", "600", "/home/mpiuser/.ssh/config"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    os.unlink(tf_path)
-                except Exception:
-                    pass
-
-            etc_hosts_line = "172.18.0.1 " + " ".join(ip_to_alias.values())
-            if self.in_container:
-                try:
-                    subprocess.run(["sudo", "sh", "-c", f"grep -q '{etc_hosts_line}' /etc/hosts || echo '{etc_hosts_line}' >> /etc/hosts"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except Exception:
-                    pass
-            else:
-                try:
-                    subprocess.run(["docker", "exec", "-u", "root", "mpi_cluster_node", "sh", "-c", f"grep -q '{etc_hosts_line}' /etc/hosts || echo '{etc_hosts_line}' >> /etc/hosts"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except Exception:
-                    pass
-
-        # Configurar todos los nodos del clúster
+        # 3. Configurar todos los nodos y preparar appfile.cfg
+        # Con Tailscale sidecar las IPs de Tailscale son directas — no se necesitan aliases ni DNAT
         appfile_lines = []
         for ip in hosts_ips:
             is_local = is_local_ip(ip)
@@ -304,30 +176,36 @@ class MPIWorker(QThread):
             
             if is_local:
                 binary_name = "/home/mpiuser/reto_final/cluster_worker"
-                host_param = "127.0.0.1"
+                host_param = ip  # Usar IP de Tailscale directamente (es la IP real del contenedor)
             else:
-                alias = ip_to_alias[ip]
-                host_param = alias
+                host_param = ip  # IP de Tailscale directa — sin aliases
                 
+                # Sincronizar directorios y verificar arquitectura de los nodos remotos
+                self.status_msg.emit(f"Preparando nodo {ip}...")
+                run_master_cmd(["ssh", "-o", "ConnectTimeout=10", ip, "mkdir -p /home/mpiuser/img"])
+                run_master_cmd(["ssh", "-o", "ConnectTimeout=10", ip, "ln -sf /home/mpiuser/reto_final/images /home/mpiuser/images"])
+
                 # Determinar nombre del binario según arquitectura del nodo remoto
-                ssh_prefix = [] if self.in_container else ["docker", "exec", "-u", "mpiuser", "mpi_cluster_node"]
                 try:
-                    res_arch = subprocess.run(ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", host_param, "uname -m"], capture_output=True, text=True, timeout=5)
+                    res_arch = run_master_cmd(["ssh", "-o", "ConnectTimeout=10", ip, "uname -m"])
                     arch_type = res_arch.stdout.strip()
                 except Exception:
                     arch_type = "x86_64"
                 
                 if "arm" in arch_type or "aarch64" in arch_type:
-                    binary_name = "/home/mpiuser/cluster_worker_mac"
+                    binary_name = "/home/mpiuser/reto_final/cluster_worker"
+                    # Compilar nativamente en la Mac (ARM64) — ya no necesita binario separado
+                    self.status_msg.emit(f"Compilando nativamente en nodo ARM64 ({ip})...")
+                    run_master_cmd(["ssh", "-o", "ConnectTimeout=10", ip, "cd /home/mpiuser/reto_final && mpic++ -fopenmp -o cluster_worker cluster_worker.c"], timeout=60)
                 else:
                     binary_name = "/home/mpiuser/reto_final/cluster_worker"
+                    self.status_msg.emit(f"Compilando en nodo x86_64 ({ip})...")
+                    run_master_cmd(["ssh", "-o", "ConnectTimeout=10", ip, "cd /home/mpiuser/reto_final && mpic++ -fopenmp -o cluster_worker cluster_worker.c"], timeout=60)
                 
-            cleanup_and_setup_vip(ip, is_local)
-            
-            appfile_lines.append(f"-env MPICH_INTERFACE_HOSTNAME {ip} -env FI_TCP_IFACE vip0 -host {host_param} -n {slots} {binary_name} {self.total_imagenes} {self.filter_mask} {self.k_grey} {self.k_color}")
+            appfile_lines.append(f"-env MPICH_INTERFACE_HOSTNAME {host_param} -host {host_param} -n {slots} {binary_name} {self.total_imagenes} {self.filter_mask} {self.k_grey} {self.k_color}")
 
         if not appfile_lines:
-            appfile_lines.append(f"-env MPICH_INTERFACE_HOSTNAME 127.0.0.1 -host 127.0.0.1 -n 4 /home/mpiuser/reto_final/cluster_worker {self.total_imagenes} {self.filter_mask} {self.k_grey} {self.k_color}")
+            appfile_lines.append(f"-host 127.0.0.1 -n 4 /home/mpiuser/reto_final/cluster_worker {self.total_imagenes} {self.filter_mask} {self.k_grey} {self.k_color}")
 
         # Escribir el archivo appfile.cfg
         appfile_path = os.path.join(self.base_dir, "appfile.cfg")
@@ -335,34 +213,35 @@ class MPIWorker(QThread):
             f.write("\n".join(appfile_lines) + "\n")
 
         # Iniciar ejecución de MPI
+        # IMPORTANTE: FI_PROVIDER=tcp y FI_TCP_IFACE=tailscale0 son NECESARIOS para que
+        # libfabric (OFI) use la interfaz Tailscale en vez de eth0 (que no es enrutable entre nodos).
+        # Sin estas variables, todos los procesos corren en el Master (shared memory) en vez de distribuirse.
+        # -iface tailscale0 le dice a hydra que use Tailscale para la comunicación PMI.
+        # -f hosts usa el archivo de hosts para distribuir los procesos correctamente.
         self.status_msg.emit("Iniciando ejecución en clúster...")
+
+        total_slots = sum(hosts_slots.values())
         
-        # Determinar si estamos en el contenedor Docker o en el Host Windows
         if self.in_container:
-            os.environ["MPIEXEC_PORT_RANGE"] = "10000:10000"
-            os.environ["MPICH_PORT_RANGE"] = "10001:10010"
             cmd = [
-                "mpiexec",
-                "-f", "hosts",
-                "-genv", "FI_PROVIDER", "tcp",
-                "-genv", "FI_TCP_PORT_LOW_RANGE", "10001",
-                "-genv", "FI_TCP_PORT_HIGH_RANGE", "10010",
-                "-configfile", "appfile.cfg"
+                "sh", "-c",
+                f"FI_PROVIDER=tcp FI_TCP_IFACE=tailscale0 mpiexec -f hosts -n {total_slots} -iface tailscale0"
+                f" /home/mpiuser/reto_final/cluster_worker {self.total_imagenes} {self.filter_mask} {self.k_grey} {self.k_color}"
             ]
         else:
             cmd = [
-                "docker", "exec", "-i", 
-                "-u", "mpiuser", 
-                "-e", "MPIEXEC_PORT_RANGE=10000:10000", 
-                "-e", "MPICH_PORT_RANGE=10001:10010",
+                "docker", "exec", "-i",
+                "-u", "mpiuser",
                 "-w", "/home/mpiuser/reto_final",
+                "-e", "FI_PROVIDER=tcp",
+                "-e", "FI_TCP_IFACE=tailscale0",
                 "mpi_cluster_node",
                 "mpiexec",
                 "-f", "hosts",
-                "-genv", "FI_PROVIDER", "tcp",
-                "-genv", "FI_TCP_PORT_LOW_RANGE", "10001",
-                "-genv", "FI_TCP_PORT_HIGH_RANGE", "10010",
-                "-configfile", "appfile.cfg"
+                "-n", str(total_slots),
+                "-iface", "tailscale0",
+                "/home/mpiuser/reto_final/cluster_worker",
+                str(self.total_imagenes), str(self.filter_mask), str(self.k_grey), str(self.k_color)
             ]
 
         self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -657,7 +536,20 @@ class MainWindow(QMainWindow):
                         ip = parts[0].split(":")[0]
                         hosts_ips.append(ip)
                         
+        in_container = os.path.exists('/home/mpiuser/reto_final')
+        ssh_prefix = [] if in_container else ["docker", "exec", "-u", "mpiuser", "mpi_cluster_node"]
+        
+        master_ips = []
+        try:
+            cmd_ips = ssh_prefix + ["hostname", "-I"]
+            res = subprocess.run(cmd_ips, capture_output=True, text=True, timeout=10)
+            master_ips = res.stdout.strip().split()
+        except Exception:
+            pass
+
         def is_local_ip(ip):
+            if ip in master_ips:
+                return True
             import socket
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
@@ -666,15 +558,20 @@ class MainWindow(QMainWindow):
                 return True
             except Exception:
                 return False
-
-        in_container = os.path.exists('/home/mpiuser/reto_final')
-        ssh_prefix = [] if in_container else ["docker", "exec", "-u", "mpiuser", "mpi_cluster_node"]
         
         for ip in hosts_ips:
             if not is_local_ip(ip):
-                cmd_sync = ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", "-p", "2222", ip, "mkdir -p /home/mpiuser/reto_final/img && cp -rf /home/mpiuser/img/* /home/mpiuser/reto_final/img/"]
+                # 1. Copiar localmente dentro de cada esclavo
+                cmd_sync = ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", ip, "mkdir -p /home/mpiuser/reto_final/img && cp -rf /home/mpiuser/img/* /home/mpiuser/reto_final/img/ 2>/dev/null || true"]
                 try:
                     subprocess.run(cmd_sync, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+                
+                # 2. Descargar las imágenes del esclavo al Master usando SCP
+                cmd_pull = ssh_prefix + ["scp", "-o", "ConnectTimeout=5", "-r", f"{ip}:/home/mpiuser/reto_final/img/*", "/home/mpiuser/reto_final/img/"]
+                try:
+                    subprocess.run(cmd_pull, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 except Exception:
                     pass
 

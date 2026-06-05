@@ -44,9 +44,7 @@ RUN mkdir /var/run/sshd \
 RUN mkdir -p /home/mpiuser/.ssh /home/mpiuser/reto_final/images
 
 # Configurar el cliente SSH dentro de la imagen
-# Dado que mapeamos el SSH al puerto 2222 en el host, configuramos para que el SSH
-# por defecto intente conectarse a ese puerto y omita la verificación interactiva de firmas
-RUN echo "Host *\n    Port 2222\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null" > /home/mpiuser/.ssh/config
+RUN echo "Host *\n    Port 22\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null" > /home/mpiuser/.ssh/config
 
 # Asegurar que todas las carpetas pertenezcan a mpiuser
 RUN chown -R mpiuser:root /home/mpiuser \
