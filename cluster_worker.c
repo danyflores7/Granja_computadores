@@ -51,17 +51,26 @@ int main(int argc, char** argv) {
     int filter_mask = 63;     // 111111 en binario (todos los filtros activos por defecto)
     int k_grey = 27;          // Tamaño de kernel para desenfoque gris por defecto
     int k_color = 27;         // Tamaño de kernel para desenfoque color por defecto
+    int start_image = 1;      // Imagen desde la cual iniciar (resiliencia: reinicio tras fallo)
 
     if (argc > 1) total_imagenes = atoi(argv[1]);
     if (argc > 2) filter_mask = atoi(argv[2]);
     if (argc > 3) k_grey = atoi(argv[3]);
     if (argc > 4) k_color = atoi(argv[4]);
+    if (argc > 5) start_image = atoi(argv[5]);
+    if (start_image < 1) start_image = 1;
+    if (start_image > total_imagenes) start_image = total_imagenes;
 
     // Asegurar que el directorio de salida 'img' existe localmente en este nodo
     system("mkdir -p img");
 
     if (world_rank == 0) {
-        printf("\n=== MASTER: Iniciando orquestación de %d imágenes ===\n", total_imagenes);
+        int n_to_process = total_imagenes - start_image + 1;
+        if (start_image > 1) {
+            printf("\n=== MASTER: REANUDANDO desde imagen %d (faltan %d imágenes) ===\n", start_image, n_to_process);
+        } else {
+            printf("\n=== MASTER: Iniciando orquestación de %d imágenes ===\n", total_imagenes);
+        }
         printf("[Master] Máscara de filtros activa: %d\n", filter_mask);
         printf("[Master] Kernels configurados - Gris: %d, Color: %d\n", k_grey, k_color);
         fflush(stdout);
@@ -101,8 +110,10 @@ int main(int argc, char** argv) {
         }
 
         double t_start = MPI_Wtime();
-        int imagen_actual = 1;
+        int imagen_actual = start_image;  // Resiliencia: iniciar desde start_image
         int imagenes_completadas = 0;
+        int images_per_node[100];
+        memset(images_per_node, 0, sizeof(images_per_node));  // Contador por nodo
 
         // 1. Enviar trabajo inicial a todos los esclavos
         for (int esclavo = 1; esclavo < world_size; esclavo++) {
@@ -118,12 +129,13 @@ int main(int argc, char** argv) {
         }
 
         // 2. Escuchar reportes y asignar más trabajo (Balanceo Dinámico)
-        while (imagenes_completadas < total_imagenes) {
+        while (imagenes_completadas < n_to_process) {
             int id_imagen_terminada;
             MPI_Status status;
             MPI_Recv(&id_imagen_terminada, 1, MPI_INT, MPI_ANY_SOURCE, TAG_TRABAJO, MPI_COMM_WORLD, &status);
             imagenes_completadas++;
             int esclavo_libre = status.MPI_SOURCE;
+            images_per_node[esclavo_libre]++;  // Registrar imagen procesada por este nodo
 
             printf("[Master] Progreso: %d/%d (Nodo %d [%s] terminó la imagen %d)\n", 
                    imagenes_completadas, total_imagenes, esclavo_libre, 
@@ -152,9 +164,22 @@ int main(int argc, char** argv) {
         printf("=== MASTER: ¡Lote de imágenes procesado por completo! ===\n");
         printf("Tiempo total de ejecución: %.6f segundos\n", tiempo_total);
         printf("Píxeles totales procesados: %.0f\n", total_pixeles);
-        // Formateado en Notación Científica estricta (%e)
         printf("Rendimiento: %e píxeles/segundo\n", pixeles_por_segundo);
-        printf("=======================================================\n\n");
+        printf("=======================================================\n");
+
+        // Imprimir estadisticas por nodo
+        printf("\n--- Distribución de trabajo por nodo ---\n");
+        int total_asignadas = 0;
+        for (int i = 1; i < world_size; i++) {
+            const char* tipo = (architectures[i] == 'W') ? "Windows (x86_64)" : "macOS (ARM64)";
+            const char* rol  = (i == 1) ? " [Master-Worker]" : "";
+            printf("  Nodo %d [%s%s]: %d imágenes (%.1f%%)\n",
+                   i, tipo, rol, images_per_node[i],
+                   (n_to_process > 0) ? (100.0 * images_per_node[i] / n_to_process) : 0.0);
+            total_asignadas += images_per_node[i];
+        }
+        printf("  TOTAL: %d imágenes procesadas\n", total_asignadas);
+        printf("-----------------------------------------\n\n");
         fflush(stdout);
 
     } else {

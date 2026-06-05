@@ -212,63 +212,280 @@ class MPIWorker(QThread):
         with open(appfile_path, "w") as f:
             f.write("\n".join(appfile_lines) + "\n")
 
-        # Iniciar ejecución de MPI
-        # IMPORTANTE: FI_PROVIDER=tcp y FI_TCP_IFACE=tailscale0 son NECESARIOS para que
-        # libfabric (OFI) use la interfaz Tailscale en vez de eth0 (que no es enrutable entre nodos).
-        # Sin estas variables, todos los procesos corren en el Master (shared memory) en vez de distribuirse.
-        # -iface tailscale0 le dice a hydra que use Tailscale para la comunicación PMI.
-        # -f hosts usa el archivo de hosts para distribuir los procesos correctamente.
+        # -----------------------------------------------------------------------
+        # Helper: construir el comando mpiexec con las variables de entorno correctas
+        # -----------------------------------------------------------------------
+        def build_mpi_cmd(active_hosts_slots, start_img):
+            total_slots = sum(active_hosts_slots.values())
+            if self.in_container:
+                return [
+                    "sh", "-c",
+                    f"FI_PROVIDER=tcp FI_TCP_IFACE=tailscale0 mpiexec -f hosts -n {total_slots} -iface tailscale0"
+                    f" /home/mpiuser/reto_final/cluster_worker {self.total_imagenes} {self.filter_mask}"
+                    f" {self.k_grey} {self.k_color} {start_img}"
+                ]
+            else:
+                return [
+                    "docker", "exec", "-i",
+                    "-u", "mpiuser",
+                    "-w", "/home/mpiuser/reto_final",
+                    "-e", "FI_PROVIDER=tcp",
+                    "-e", "FI_TCP_IFACE=tailscale0",
+                    "mpi_cluster_node",
+                    "mpiexec",
+                    "-f", "hosts",
+                    "-n", str(total_slots),
+                    "-iface", "tailscale0",
+                    "/home/mpiuser/reto_final/cluster_worker",
+                    str(self.total_imagenes), str(self.filter_mask),
+                    str(self.k_grey), str(self.k_color), str(start_img)
+                ]
+
+        # -----------------------------------------------------------------------
+        # Helper: detectar qué imágenes ya están completamente procesadas
+        # Revisa en TODOS los nodos el directorio img/ para encontrar la primera
+        # imagen que NO tiene todos los archivos de filtro requeridos.
+        # -----------------------------------------------------------------------
+        def get_filter_suffixes():
+            suffixes = []
+            if self.filter_mask & 1:  suffixes.append("vg")
+            if self.filter_mask & 2:  suffixes.append("vc")
+            if self.filter_mask & 4:  suffixes.append("hg")
+            if self.filter_mask & 8:  suffixes.append("hc")
+            if self.filter_mask & 16: suffixes.append("dg")
+            if self.filter_mask & 32: suffixes.append("dc")
+            return suffixes
+
+        def find_first_unprocessed(active_ips, total_imgs):
+            """Revisa img/ en todos los nodos y retorna el primer ID de imagen no completado."""
+            suffixes = get_filter_suffixes()
+            if not suffixes:
+                return None
+            completed = set()
+            # Verificar en cada nodo
+            for ip in active_ips:
+                try:
+                    check_cmd = " && ".join(
+                        [f"ls /home/mpiuser/reto_final/img/imagen_{{:03d}}_{s}.bmp".format(i)
+                         for i in range(1, total_imgs + 1)
+                         for s in suffixes]
+                    )
+                    # Construir comando más eficiente: listar todos los bmp y filtrar
+                    list_cmd = "ls /home/mpiuser/reto_final/img/*.bmp 2>/dev/null || true"
+                    if is_local_ip(ip):
+                        res = run_master_cmd(["sh", "-c", list_cmd], timeout=10)
+                    else:
+                        res = run_master_cmd(["ssh", "-o", "ConnectTimeout=5", ip, list_cmd], timeout=15)
+                    files = set(os.path.basename(f.strip()) for f in res.stdout.splitlines() if f.strip())
+                    for i in range(1, total_imgs + 1):
+                        if all(f"imagen_{i:03d}_{s}.bmp" in files for s in suffixes):
+                            completed.add(i)
+                except Exception:
+                    pass
+
+            for i in range(1, total_imgs + 1):
+                if i not in completed:
+                    return i
+            return None  # Todo completo
+
+        # -----------------------------------------------------------------------
+        # Helper: detectar nodos caídos (no responden a SSH)
+        # -----------------------------------------------------------------------
+        def get_alive_hosts(current_hosts_slots):
+            alive = {}
+            for ip, slots in current_hosts_slots.items():
+                if is_local_ip(ip):
+                    alive[ip] = slots  # Master siempre está vivo
+                else:
+                    try:
+                        res = run_master_cmd(["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                                               ip, "echo OK"], timeout=8)
+                        if "OK" in res.stdout:
+                            alive[ip] = slots
+                        else:
+                            self.log_received.emit(f"⚠️ Nodo {ip} no responde — excluido del reinicio")
+                    except Exception:
+                        self.log_received.emit(f"⚠️ Nodo {ip} no responde — excluido del reinicio")
+            return alive
+
+        # -----------------------------------------------------------------------
+        # Helper: reescribir el archivo hosts con los nodos activos
+        # -----------------------------------------------------------------------
+        def write_hosts_file(active_hosts_slots):
+            with open(self.hosts_path, "w") as f:
+                for ip, slots in active_hosts_slots.items():
+                    f.write(f"{ip}:{slots}\n")
+
+        # -----------------------------------------------------------------------
+        # Ejecución principal con lógica de resiliencia (hasta 2 reintentos)
+        # -----------------------------------------------------------------------
         self.status_msg.emit("Iniciando ejecución en clúster...")
-
         total_slots = sum(hosts_slots.values())
-        
-        if self.in_container:
-            cmd = [
-                "sh", "-c",
-                f"FI_PROVIDER=tcp FI_TCP_IFACE=tailscale0 mpiexec -f hosts -n {total_slots} -iface tailscale0"
-                f" /home/mpiuser/reto_final/cluster_worker {self.total_imagenes} {self.filter_mask} {self.k_grey} {self.k_color}"
-            ]
-        else:
-            cmd = [
-                "docker", "exec", "-i",
-                "-u", "mpiuser",
-                "-w", "/home/mpiuser/reto_final",
-                "-e", "FI_PROVIDER=tcp",
-                "-e", "FI_TCP_IFACE=tailscale0",
-                "mpi_cluster_node",
-                "mpiexec",
-                "-f", "hosts",
-                "-n", str(total_slots),
-                "-iface", "tailscale0",
-                "/home/mpiuser/reto_final/cluster_worker",
-                str(self.total_imagenes), str(self.filter_mask), str(self.k_grey), str(self.k_color)
-            ]
 
-        self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-        
+        current_hosts_slots = dict(hosts_slots)
+        start_img = 1
         pattern = re.compile(r"\[Master\] Progreso:\s+(\d+)/(\d+)")
-        
-        while True:
-            line = self.process.stdout.readline()
-            if not line and self.process.poll() is not None:
-                break
-            
-            if line:
-                line_str = line.strip()
-                self.log_received.emit(line_str)
-                
-                match = pattern.search(line_str)
-                if match:
-                    completadas = int(match.group(1))
-                    totales = int(match.group(2))
-                    self.progress_updated.emit(completadas, totales)
-                    
-        elapsed = time.time() - self.start_time
-        ret = self.process.poll()
-        if ret == 0:
+        max_retries = 2
+        dead_nodes = []       # IPs de nodos que se cayeron
+        resilience_events = []  # Registro de eventos de recuperacion
+
+        # -----------------------------------------------------------------------
+        # Helper: emitir RESUMEN FINAL completo (reutilizable desde cualquier salida)
+        # -----------------------------------------------------------------------
+        def emit_resumen(elapsed):
+            self.log_received.emit("\n" + "="*55)
+            self.log_received.emit("=== RESUMEN FINAL DE EJECUCIÓN ===")
+            self.log_received.emit("="*55)
+
+            if dead_nodes:
+                self.log_received.emit(f"⚠️  Nodos que se desconectaron: {', '.join(dead_nodes)}")
+                for ev in resilience_events:
+                    self.log_received.emit(f"    ↳ {ev}")
+            else:
+                self.log_received.emit("✅  Todos los nodos funcionaron sin interrupciones")
+
+            # Contar imágenes por nodo (esclavos primero para evitar doble conteo por SCP)
+            self.log_received.emit("\n📊 Imágenes procesadas por máquina:")
+            suffixes = get_filter_suffixes()
+            claimed = set()
+            node_counts = {}
+            slave_ips_r  = [(ip, s) for ip, s in current_hosts_slots.items() if not is_local_ip(ip)]
+            master_ips_r = [(ip, s) for ip, s in current_hosts_slots.items() if is_local_ip(ip)]
+            dead_ips_r   = [(d, 0) for d in dead_nodes]
+            scan_order   = slave_ips_r + master_ips_r + dead_ips_r
+
+            for ip, slots in scan_order:
+                try:
+                    list_cmd = "ls /home/mpiuser/reto_final/img/*.bmp 2>/dev/null || true"
+                    if is_local_ip(ip):
+                        res = run_master_cmd(["sh", "-c", list_cmd], timeout=10)
+                        label = "Master (este nodo)"
+                    else:
+                        res = run_master_cmd(["ssh", "-o", "ConnectTimeout=5", ip, list_cmd], timeout=15)
+                        label = ip
+                    if ip in dead_nodes:
+                        label += " ⚠️ (cayó durante ejecución)"
+                    files = set(os.path.basename(f.strip()) for f in res.stdout.splitlines() if f.strip())
+                    count = 0
+                    for i in range(1, self.total_imagenes + 1):
+                        if i not in claimed and suffixes and all(f"imagen_{i:03d}_{s}.bmp" in files for s in suffixes):
+                            count += 1
+                            if ip not in dead_nodes:
+                                claimed.add(i)
+                    pct = (100.0 * count / self.total_imagenes) if self.total_imagenes > 0 else 0
+                    self.log_received.emit(f"    {label}: {count} imágenes ({pct:.1f}%)")
+                    node_counts[ip] = count
+                except Exception as e:
+                    self.log_received.emit(f"    {ip}: no disponible ({e})")
+
+            total_confirmadas = len(claimed)
+            self.log_received.emit(f"    ─────────────────────────────")
+            self.log_received.emit(f"    TOTAL únicas confirmadas: {total_confirmadas}/{self.total_imagenes} imágenes")
+            self.log_received.emit("="*55 + "\n")
+
+            # Restaurar hosts si fue modificado por resiliencia
+            if dead_nodes:
+                write_hosts_file(hosts_slots)
+                self.log_received.emit("🔄 Archivo hosts restaurado con todos los nodos para la próxima ejecución.")
+
+            # SCP Sync en el hilo del worker (no bloquea la UI)
+            self.status_msg.emit("Sincronizando imágenes de los esclavos al Master...")
+            for ip in hosts_ips:
+                if not is_local_ip(ip):
+                    try:
+                        run_master_cmd(["ssh", "-o", "ConnectTimeout=5", ip,
+                                        "mkdir -p /home/mpiuser/reto_final/img && "
+                                        "cp -rf /home/mpiuser/img/* /home/mpiuser/reto_final/img/ 2>/dev/null || true"],
+                                       timeout=15)
+                    except Exception:
+                        pass
+                    try:
+                        run_master_cmd(["scp", "-o", "ConnectTimeout=5", "-r",
+                                        f"{ip}:/home/mpiuser/reto_final/img/*",
+                                        "/home/mpiuser/reto_final/img/"], timeout=120)
+                    except Exception:
+                        pass
+            self.status_msg.emit("Sincronización completada.")
             self.finished_successfully.emit(elapsed)
-        else:
-            self.finished_with_error.emit(ret)
+
+
+        for intento in range(max_retries + 1):
+            if intento > 0:
+                self.log_received.emit(f"\n🔄 === REINTENTO {intento}/{max_retries}: Buscando imágenes pendientes... ===")
+                self.status_msg.emit(f"Recuperando tras fallo — reintento {intento}...")
+
+                # Detectar nodos vivos
+                alive = get_alive_hosts(current_hosts_slots)
+                if not alive:
+                    self.log_received.emit("❌ No hay nodos disponibles para continuar.")
+                    break
+                if alive != current_hosts_slots:
+                    dead = set(current_hosts_slots) - set(alive)
+                    for d in dead:
+                        self.log_received.emit(f"🔴 Nodo caído detectado: {d} — removido del cluster")
+                        dead_nodes.append(d)
+                    current_hosts_slots = alive
+                    write_hosts_file(current_hosts_slots)
+                    self.log_received.emit("📝 Archivo hosts actualizado con nodos sobrevivientes")
+
+                # Encontrar primera imagen sin procesar
+                self.status_msg.emit("Escaneando imágenes completadas en todos los nodos...")
+                first_pending = find_first_unprocessed(list(current_hosts_slots.keys()), self.total_imagenes)
+                if first_pending is None:
+                    self.log_received.emit("✅ Todas las imágenes ya están procesadas. No es necesario reiniciar.")
+                    elapsed = time.time() - self.start_time
+                    emit_resumen(elapsed)
+                    return
+                start_img = first_pending
+                event_msg = (f"Reintento {intento}: reanudado desde imagen {start_img}, "
+                             f"nodos caídos: {', '.join(dead_nodes) if dead_nodes else 'ninguno'}")
+                resilience_events.append(event_msg)
+                self.log_received.emit(f"📌 Reanudando desde imagen {start_img} "
+                                       f"({self.total_imagenes - start_img + 1} imágenes pendientes)")
+
+                # Recompilar en nodos sobrevivientes
+                for ip, _ in current_hosts_slots.items():
+                    if not is_local_ip(ip):
+                        self.status_msg.emit(f"Recompilando en nodo sobreviviente {ip}...")
+                        run_master_cmd(["ssh", "-o", "ConnectTimeout=10", ip,
+                                        "cd /home/mpiuser/reto_final && mpic++ -fopenmp -o cluster_worker cluster_worker.c"],
+                                       timeout=60)
+
+            cmd = build_mpi_cmd(current_hosts_slots, start_img)
+            self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                            text=True, bufsize=1)
+
+            while True:
+                line = self.process.stdout.readline()
+                if not line and self.process.poll() is not None:
+                    break
+                if line:
+                    line_str = line.strip()
+                    self.log_received.emit(line_str)
+                    match = pattern.search(line_str)
+                    if match:
+                        completadas = int(match.group(1))
+                        totales = int(match.group(2))
+                        self.progress_updated.emit(completadas, totales)
+
+            ret = self.process.poll()
+            if ret == 0:
+                elapsed = time.time() - self.start_time
+                emit_resumen(elapsed)
+                return
+            else:
+                self.log_received.emit(f"\n⚠️ MPI terminó con código {ret} — verificando si fue fallo de nodo...")
+                if intento == max_retries:
+                    self.log_received.emit("❌ Se agotaron los reintentos.")
+                    break
+
+        elapsed = time.time() - self.start_time
+        # Restaurar el hosts original si fue modificado por resiliencia
+        if dead_nodes:
+            write_hosts_file(hosts_slots)  # Restaurar con todos los nodos originales
+            self.log_received.emit("\n🔄 Archivo hosts restaurado con todos los nodos originales para la próxima ejecución.")
+        self.finished_with_error.emit(ret)
+
 
 class AboutDialog(QDialog):
     def __init__(self, parent=None):
@@ -520,71 +737,20 @@ class MainWindow(QMainWindow):
     def on_finished_successfully(self, elapsed):
         self.btn_ejecutar.setEnabled(True)
         self.progress_bar.setValue(100)
-        self.lbl_estimador.setText("Sincronizando imágenes de la Mac...")
-        QApplication.processEvents()
-        
-        # Sincronizar imágenes procesadas localmente en la Mac hacia el volumen compartido del Host
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        hosts_path = os.path.join(base_dir, "hosts")
-        hosts_ips = []
-        if os.path.exists(hosts_path):
-            with open(hosts_path, "r") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        parts = line.split()
-                        ip = parts[0].split(":")[0]
-                        hosts_ips.append(ip)
-                        
-        in_container = os.path.exists('/home/mpiuser/reto_final')
-        ssh_prefix = [] if in_container else ["docker", "exec", "-u", "mpiuser", "mpi_cluster_node"]
-        
-        master_ips = []
-        try:
-            cmd_ips = ssh_prefix + ["hostname", "-I"]
-            res = subprocess.run(cmd_ips, capture_output=True, text=True, timeout=10)
-            master_ips = res.stdout.strip().split()
-        except Exception:
-            pass
-
-        def is_local_ip(ip):
-            if ip in master_ips:
-                return True
-            import socket
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                s.bind((ip, 0))
-                s.close()
-                return True
-            except Exception:
-                return False
-        
-        for ip in hosts_ips:
-            if not is_local_ip(ip):
-                # 1. Copiar localmente dentro de cada esclavo
-                cmd_sync = ssh_prefix + ["ssh", "-o", "ConnectTimeout=5", ip, "mkdir -p /home/mpiuser/reto_final/img && cp -rf /home/mpiuser/img/* /home/mpiuser/reto_final/img/ 2>/dev/null || true"]
-                try:
-                    subprocess.run(cmd_sync, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except Exception:
-                    pass
-                
-                # 2. Descargar las imágenes del esclavo al Master usando SCP
-                cmd_pull = ssh_prefix + ["scp", "-o", "ConnectTimeout=5", "-r", f"{ip}:/home/mpiuser/reto_final/img/*", "/home/mpiuser/reto_final/img/"]
-                try:
-                    subprocess.run(cmd_pull, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except Exception:
-                    pass
-
         self.lbl_estimador.setText("Ejecución completada.")
         self.tiempo_entry.setText(f"{elapsed:.4f} segundos")
-        
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
         img_dir = os.path.join(base_dir, "img")
         self.ruta_entry.setText(img_dir)
-        
+
         self.drop_area.image_paths.clear()
         self.drop_area.update_display()
-        
-        QMessageBox.information(self, "Ejecución Exitosa", f"Procesamiento distribuido completado.\nLas imágenes se han guardado en ./img/\nTiempo: {elapsed:.4f} seg")
+
+        QMessageBox.information(self, "Ejecución Exitosa",
+                                f"Procesamiento distribuido completado.\n"
+                                f"Las imágenes se han guardado en ./img/\n"
+                                f"Tiempo: {elapsed:.4f} seg")
 
     def on_finished_with_error(self, exit_code):
         self.btn_ejecutar.setEnabled(True)
