@@ -3,19 +3,20 @@ import os
 import time
 import re
 import subprocess
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QLabel, QCheckBox, QLineEdit, QPushButton, QGridLayout, 
-                             QMessageBox, QDialog, QProgressBar, QAction)
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                             QLabel, QCheckBox, QLineEdit, QPushButton, QGridLayout,
+                             QMessageBox, QDialog, QProgressBar, QAction, QFileDialog)
 from PyQt5.QtGui import QIntValidator, QPixmap, QColor, QPalette
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 class DropArea(QLabel):
     def __init__(self):
-        super().__init__("Arrastra imágenes\nmáximo 10\n.bmp")
+        super().__init__("Arrastra imágenes .bmp\no selecciona una carpeta")
         self.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.setStyleSheet("background-color: #2b2b2b; color: white; padding: 10px; border: 1px solid #555;")
         self.setAcceptDrops(True)
-        self.setMinimumSize(300, 200)
+        self.setMinimumSize(300, 130)
+        self.setMaximumSize(9999, 130)
         self.image_paths = []
 
     def dragEnterEvent(self, event):
@@ -36,21 +37,35 @@ class DropArea(QLabel):
             path = url.toLocalFile()
             if path.lower().endswith(".bmp"):
                 if path not in self.image_paths:
-                    if len(self.image_paths) < 10:
+                    if len(self.image_paths) < 600:
                         self.image_paths.append(path)
                     else:
-                        QMessageBox.warning(self, "Límite alcanzado", "No puedes subir más de 10 imágenes.")
+                        QMessageBox.warning(self, "Límite alcanzado", "No puedes cargar más de 600 imágenes.")
                         break
-        
         self.update_display()
+
+    def load_folder(self, folder_path):
+        """Carga todos los .bmp de una carpeta (hasta 600 archivos)."""
+        all_bmp = sorted([
+            os.path.join(folder_path, f)
+            for f in os.listdir(folder_path)
+            if f.lower().endswith('.bmp')
+        ])
+        self.image_paths = all_bmp[:600]
+        self.update_display()
+        return len(self.image_paths)
 
     def update_display(self):
         if not self.image_paths:
-            self.setText("Arrastra imágenes\nmáximo 10\n.bmp")
+            self.setText("Arrastra imágenes .bmp\no selecciona una carpeta")
         else:
-            text = "Archivos cargados:\n"
-            for p in self.image_paths:
-                text += f"- {os.path.basename(p)}\n"
+            n = len(self.image_paths)
+            folder = os.path.dirname(self.image_paths[0])
+            text = f"📁 {n} archivo(s) desde: {os.path.basename(folder)}\n"
+            for p in self.image_paths[:4]:
+                text += f"  - {os.path.basename(p)}\n"
+            if n > 4:
+                text += f"  ... y {n - 4} más"
             self.setText(text)
 
 class OddIntValidator(QIntValidator):
@@ -182,8 +197,17 @@ class MPIWorker(QThread):
                 
                 # Sincronizar directorios y verificar arquitectura de los nodos remotos
                 self.status_msg.emit(f"Preparando nodo {ip}...")
-                run_master_cmd(["ssh", "-o", "ConnectTimeout=10", ip, "mkdir -p /home/mpiuser/img"])
-                run_master_cmd(["ssh", "-o", "ConnectTimeout=10", ip, "ln -sf /home/mpiuser/reto_final/images /home/mpiuser/images"])
+                try:
+                    run_master_cmd(["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                                    ip, "mkdir -p /home/mpiuser/img"], timeout=12)
+                except Exception:
+                    pass
+                try:
+                    run_master_cmd(["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                                    ip, "ln -sf /home/mpiuser/reto_final/images /home/mpiuser/images"], timeout=12)
+                except Exception:
+                    pass
+
 
                 # Determinar nombre del binario según arquitectura del nodo remoto
                 try:
@@ -453,7 +477,7 @@ class MPIWorker(QThread):
 
             cmd = build_mpi_cmd(current_hosts_slots, start_img)
             self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                            text=True, bufsize=1)
+                                            text=True, bufsize=1, encoding='utf-8', errors='replace')
 
             while True:
                 line = self.process.stdout.readline()
@@ -501,10 +525,11 @@ class AboutDialog(QDialog):
             "Tecnológico de Monterrey\n"
             "Campus Puebla\n"
             "Junio 2026\n\n"
-            "Equipo:\n"
-            "1- Emmanuel Torres Rios\n"
-            "2- Daniel Flores Rojas\n"
-            "3- Clúster Híbrido Heterogéneo MPICH"
+            "Integrantes:\n"
+            "• Daniel Flores Rojas - A01737719\n"
+            "• Ezio Uriel Saucedo Diaz - A01737652\n"
+            "• Kevin Nuñez - A01737131\n\n"
+            "Clúster Híbrido Heterogéneo MPICH"
         )
         info_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         info_label.setStyleSheet("padding: 20px;")
@@ -524,7 +549,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Procesamiento de imágenes por Clúster MPI")
-        self.setFixedSize(750, 550)
+        self.setFixedSize(820, 660)
         self.setStyleSheet("background-color: #323232; color: #E0E0E0;")
         
         self.init_ui()
@@ -554,13 +579,21 @@ class MainWindow(QMainWindow):
         
         self.drop_area = DropArea()
         left_layout.addWidget(self.drop_area)
-        
+
+        # Botón seleccionar carpeta
+        self.btn_carpeta = QPushButton("📁  Seleccionar Carpeta (hasta 600 imágenes)")
+        self.btn_carpeta.clicked.connect(self.on_select_folder)
+        self.btn_carpeta.setStyleSheet(
+            "background-color: #1a6bb5; color: white; border-radius: 4px; "
+            "padding: 5px 10px; font-size: 11px;")
+        left_layout.addWidget(self.btn_carpeta)
+
         tiempo_label = QLabel("Tiempo de ejecución")
         self.tiempo_entry = QLineEdit()
         self.tiempo_entry.setReadOnly(True)
         self.tiempo_entry.setStyleSheet("background-color: #2b2b2b; color: white; border: none; padding: 5px;")
         
-        ruta_label = QLabel("Ruta de archivos")
+        ruta_label = QLabel("Ruta de archivos de salida")
         self.ruta_entry = QLineEdit()
         self.ruta_entry.setReadOnly(True)
         self.ruta_entry.setStyleSheet("background-color: #2b2b2b; color: white; border: none; padding: 5px;")
@@ -568,19 +601,84 @@ class MainWindow(QMainWindow):
         # Progress Bar and Estimator
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
-        self.progress_bar.setStyleSheet("QProgressBar { background-color: #2b2b2b; color: white; border: 1px solid #555; text-align: center; height: 20px; } QProgressBar::chunk { background-color: #00aa00; }")
+        self.progress_bar.setStyleSheet(
+            "QProgressBar { background-color: #2b2b2b; color: white; border: 1px solid #555; "
+            "text-align: center; height: 20px; } "
+            "QProgressBar::chunk { background-color: #00aa00; }")
         
         self.lbl_estimador = QLabel("Tiempo restante: N/A")
         self.lbl_estimador.setStyleSheet("color: #aaa; font-size: 11px;")
-        
-        left_layout.addSpacing(15)
+
+        # --- Panel de Métricas ---
+        metrics_label = QLabel("📊 Métricas de Ejecución")
+        metrics_label.setStyleSheet("color: #00cc66; font-weight: bold; font-size: 11px; margin-top: 6px;")
+
+        m_style = "background-color: #1e1e1e; color: #00ff88; border: none; padding: 3px 5px; font-family: monospace; font-size: 11px;"
+
+        px_row = QHBoxLayout()
+        px_row.addWidget(QLabel("Píxeles totales:"))
+        self.lbl_pixeles = QLineEdit("—")
+        self.lbl_pixeles.setReadOnly(True)
+        self.lbl_pixeles.setStyleSheet(m_style)
+        px_row.addWidget(self.lbl_pixeles)
+
+        rend_row = QHBoxLayout()
+        rend_row.addWidget(QLabel("Rendimiento:    "))
+        self.lbl_rendimiento = QLineEdit("—")
+        self.lbl_rendimiento.setReadOnly(True)
+        self.lbl_rendimiento.setStyleSheet(m_style)
+        rend_row.addWidget(self.lbl_rendimiento)
+
+        conf_row = QHBoxLayout()
+        conf_row.addWidget(QLabel("Imágenes conf.:  "))
+        self.lbl_confirmadas = QLineEdit("—")
+        self.lbl_confirmadas.setReadOnly(True)
+        self.lbl_confirmadas.setStyleSheet(m_style)
+        conf_row.addWidget(self.lbl_confirmadas)
+
         left_layout.addWidget(tiempo_label)
         left_layout.addWidget(self.tiempo_entry)
         left_layout.addWidget(ruta_label)
         left_layout.addWidget(self.ruta_entry)
-        left_layout.addSpacing(15)
         left_layout.addWidget(self.progress_bar)
         left_layout.addWidget(self.lbl_estimador)
+        left_layout.addWidget(metrics_label)
+        left_layout.addLayout(px_row)
+        left_layout.addLayout(rend_row)
+        left_layout.addLayout(conf_row)
+
+        # --- Comparativa de Costos AWS vs Clúster ---
+        aws_label = QLabel("💰 Comparativa Anual AWS vs. Local")
+        aws_label.setStyleSheet("color: #00aaff; font-weight: bold; font-size: 11px; margin-top: 8px;")
+
+        aws_style = "background-color: #1e1e1e; color: #ff9900; border: none; padding: 3px 5px; font-family: monospace; font-size: 11px;"
+        local_style = "background-color: #1e1e1e; color: #00ff88; border: none; padding: 3px 5px; font-family: monospace; font-size: 11px;"
+
+        local_row = QHBoxLayout()
+        local_row.addWidget(QLabel("Clúster Local:  "))
+        self.lbl_costo_local = QLineEdit("$1,718 USD/año ($207 si hwd ya existe)")
+        self.lbl_costo_local.setReadOnly(True)
+        self.lbl_costo_local.setStyleSheet(local_style)
+        local_row.addWidget(self.lbl_costo_local)
+
+        ondemand_row = QHBoxLayout()
+        ondemand_row.addWidget(QLabel("AWS On-Demand:  "))
+        self.lbl_costo_aws = QLineEdit("$2,282 USD/año (1.3x más caro)")
+        self.lbl_costo_aws.setReadOnly(True)
+        self.lbl_costo_aws.setStyleSheet(aws_style)
+        ondemand_row.addWidget(self.lbl_costo_aws)
+
+        spot_row = QHBoxLayout()
+        spot_row.addWidget(QLabel("AWS Batch Spot: "))
+        self.lbl_costo_spot = QLineEdit("$685 USD/año (ahorro 60%)")
+        self.lbl_costo_spot.setReadOnly(True)
+        self.lbl_costo_spot.setStyleSheet(aws_style)
+        spot_row.addWidget(self.lbl_costo_spot)
+
+        left_layout.addWidget(aws_label)
+        left_layout.addLayout(local_row)
+        left_layout.addLayout(ondemand_row)
+        left_layout.addLayout(spot_row)
         left_layout.addStretch()
         
         # Right side
@@ -663,6 +761,17 @@ class MainWindow(QMainWindow):
         main_layout.addSpacing(30)
         main_layout.addLayout(right_layout, stretch=2)
 
+    def on_select_folder(self):
+        """Abre un diálogo para seleccionar una carpeta de imágenes."""
+        folder = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta de imágenes .bmp")
+        if folder:
+            count = self.drop_area.load_folder(folder)
+            if count == 0:
+                QMessageBox.warning(self, "Sin imágenes",
+                                    "No se encontraron archivos .bmp en la carpeta seleccionada.")
+            else:
+                self.lbl_estimador.setText(f"📁 {count} imagen(es) cargada(s) desde carpeta")
+
     def select_all(self):
         all_checked = all(cb.isChecked() for cb in self.checkboxes)
         for cb in self.checkboxes:
@@ -722,6 +831,17 @@ class MainWindow(QMainWindow):
 
     def on_log_received(self, line):
         print(line, flush=True)
+        # Parsear métricas del output MPI y actualizar la GUI
+        m_px = re.search(r'P[ií]xeles totales procesados:\s*(\d+)', line)
+        if m_px:
+            px = int(m_px.group(1))
+            self.lbl_pixeles.setText(f"{px:.4e} px")
+        m_rend = re.search(r'Rendimiento:\s*([\d.e+\-]+)', line)
+        if m_rend:
+            self.lbl_rendimiento.setText(f"{m_rend.group(1)} px/s")
+        m_conf = re.search(r'TOTAL [uú]nicas confirmadas:\s*(\d+)/(\d+)', line)
+        if m_conf:
+            self.lbl_confirmadas.setText(f"{m_conf.group(1)}/{m_conf.group(2)} imágenes")
 
     def on_progress_updated(self, completadas, totales):
         pct = int((completadas / totales) * 100)

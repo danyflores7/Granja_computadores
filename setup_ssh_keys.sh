@@ -1,39 +1,64 @@
 #!/bin/sh
-# Script para configurar claves SSH entre todos los nodos del cluster
+# Script dinámico para configurar claves SSH bidireccionales en el clúster
 
-echo "=== Generando clave SSH en nodo Mac ==="
-ssh -o StrictHostKeyChecking=no 100.108.94.102 "ssh-keygen -t rsa -f /home/mpiuser/.ssh/id_rsa -q -N '' 2>/dev/null; echo done"
+HOSTS_FILE="/home/mpiuser/reto_final/hosts"
+MASTER_IP="100.119.107.51"
 
-echo "=== Generando clave SSH en nodo Windows ==="
-ssh -o StrictHostKeyChecking=no 100.126.201.74 "ssh-keygen -t rsa -f /home/mpiuser/.ssh/id_rsa -q -N '' 2>/dev/null; echo done"
+if [ ! -f "$HOSTS_FILE" ]; then
+    echo "❌ Error: No se encontró el archivo de hosts en $HOSTS_FILE"
+    exit 1
+fi
 
-echo "=== Agregando clave del Mac al Master ==="
-ssh -o StrictHostKeyChecking=no 100.108.94.102 cat /home/mpiuser/.ssh/id_rsa.pub >> /home/mpiuser/.ssh/authorized_keys
+# 1. Asegurar que el Master tiene su propia clave SSH
+if [ ! -f "/home/mpiuser/.ssh/id_rsa" ]; then
+    echo "🔑 Generando clave SSH en el Master..."
+    ssh-keygen -t rsa -f /home/mpiuser/.ssh/id_rsa -q -N ""
+fi
 
-echo "=== Agregando clave del Windows al Master ==="
-ssh -o StrictHostKeyChecking=no 100.126.201.74 cat /home/mpiuser/.ssh/id_rsa.pub >> /home/mpiuser/.ssh/authorized_keys
+echo "============================================="
+echo " Configurando Llaves SSH del Clúster        "
+echo "============================================="
 
-echo "=== Copiando clave del Master al Mac (para que Mac confie en Master) ==="
-cat /home/mpiuser/.ssh/id_rsa.pub | ssh -o StrictHostKeyChecking=no 100.108.94.102 "cat >> /home/mpiuser/.ssh/authorized_keys"
+# Limpiar authorized_keys del master antes de recolectar claves para evitar duplicados
+cat /home/mpiuser/.ssh/id_rsa.pub > /home/mpiuser/.ssh/authorized_keys
 
-echo "=== Copiando clave del Master al Windows (para que Windows confie en Master) ==="
-cat /home/mpiuser/.ssh/id_rsa.pub | ssh -o StrictHostKeyChecking=no 100.126.201.74 "cat >> /home/mpiuser/.ssh/authorized_keys"
+for entry in $(cat "$HOSTS_FILE"); do
+    ip=$(echo "$entry" | cut -d: -f1)
+    
+    # Ignorar líneas vacías, comentarios o la IP local del Master
+    if [ -z "$ip" ] || echo "$ip" | grep -q "^#" || [ "$ip" = "$MASTER_IP" ]; then
+        continue
+    fi
+    
+    echo "⚙️ Configurando nodo esclavo: $ip ..."
+    
+    # A. Copiar clave del Master al Esclavo usando sshpass (contraseña por defecto 'mpi')
+    echo "   -> Copiando clave del Master al Esclavo..."
+    sshpass -p 'mpi' ssh-copy-id -f -o StrictHostKeyChecking=no "mpiuser@$ip" 2>/dev/null
+    
+    if [ $? -eq 0 ]; then
+        echo "   ✅ Conexión Master -> Esclavo lista sin contraseña."
+        
+        # B. Generar clave SSH interna dentro del nodo esclavo si no existe
+        echo "   -> Generando clave SSH dentro del Esclavo..."
+        ssh -o StrictHostKeyChecking=no "mpiuser@$ip" "if [ ! -f /home/mpiuser/.ssh/id_rsa ]; then ssh-keygen -t rsa -f /home/mpiuser/.ssh/id_rsa -q -N ''; fi"
+        
+        # C. Copiar clave del Esclavo de regreso al Master para confianza mutua (SSH inverso)
+        echo "   -> Registrando clave del Esclavo en el Master..."
+        esclavo_pub=$(ssh -o StrictHostKeyChecking=no "mpiuser@$ip" "cat /home/mpiuser/.ssh/id_rsa.pub")
+        if [ ! -z "$esclavo_pub" ]; then
+            echo "$esclavo_pub" >> /home/mpiuser/.ssh/authorized_keys
+            echo "   ✅ Conexión Esclavo -> Master lista sin contraseña."
+        else
+            echo "   ❌ Error al leer clave pública del esclavo."
+        fi
+    else
+        echo "   ❌ ERROR: No se pudo conectar al esclavo $ip (¿Está apagado o Tailscale está desconectado?)"
+    fi
+    echo "---------------------------------------------"
+done
 
-echo "=== Copiando clave del Mac al Windows ==="
-ssh -o StrictHostKeyChecking=no 100.108.94.102 cat /home/mpiuser/.ssh/id_rsa.pub | ssh -o StrictHostKeyChecking=no 100.126.201.74 "cat >> /home/mpiuser/.ssh/authorized_keys"
-
-echo "=== Copiando clave del Windows al Mac ==="
-ssh -o StrictHostKeyChecking=no 100.126.201.74 cat /home/mpiuser/.ssh/id_rsa.pub | ssh -o StrictHostKeyChecking=no 100.108.94.102 "cat >> /home/mpiuser/.ssh/authorized_keys"
-
-echo "=== Verificando conexiones sin contraseña ==="
-ssh -o StrictHostKeyChecking=no 100.119.107.51 echo "Master OK"
-ssh -o StrictHostKeyChecking=no 100.108.94.102 echo "Mac OK"
-ssh -o StrictHostKeyChecking=no 100.126.201.74 echo "Windows OK"
-
-echo "=== Verificando desde Mac hacia Master ==="
-ssh -o StrictHostKeyChecking=no 100.108.94.102 "ssh -o StrictHostKeyChecking=no 100.119.107.51 echo MAC_TO_MASTER_OK"
-
-echo "=== Verificando desde Windows hacia Master ==="
-ssh -o StrictHostKeyChecking=no 100.126.201.74 "ssh -o StrictHostKeyChecking=no 100.119.107.51 echo WIN_TO_MASTER_OK"
-
-echo "=== CONFIGURACION SSH COMPLETA ==="
+echo "============================================="
+echo " Verificando Conectividad Final...          "
+echo "============================================="
+sh /home/mpiuser/reto_final/check_hosts.sh
